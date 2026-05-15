@@ -83,7 +83,7 @@ class Qwen3MLP(nn.Module):
         self.layer_idx = -1 if layer_idx is None else layer_idx
         if getattr(config, "ttt_mode", False) and self.layer_idx in getattr(config, "ttt_layers", []):
             self.ttt_chunk = getattr(config, "ttt_chunk", 8192)
-            if getattr(config, "ttt_proj", True):
+            if getattr(config, "ttt_proj", True): # 应该是原文的W_target, V[i] = Conv1D() @ W_target @ h[i]
                 self.ttt_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
             else:
                 self.ttt_proj = None
@@ -95,6 +95,10 @@ class Qwen3MLP(nn.Module):
 
     # TTT: new method
     def padding(self, x):
+        """
+        如果是TTT层，则将序列padding到ttt_chunk的整数倍
+        返回形状：[batch_size, seq_len // ttt_chunk, ttt_chunk, hidden_size]
+        """
         if not hasattr(self, "ttt_chunk"):
             return x
         if x.shape[1] % self.ttt_chunk != 0:
@@ -103,38 +107,54 @@ class Qwen3MLP(nn.Module):
                 device=x.device, dtype=x.dtype,
             )
             x = torch.cat([x, padding_embeddings], dim=1)
+        # b: batch size, t: chunk num, c: chunk size, d: hidden size
         return rearrange(x, "b (t c) d -> b t c d", c=self.ttt_chunk)
 
     def forward(self, x, t: Optional[torch.Tensor] = None):  # TTT: added t param
-        h = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+        """
+        Args:
+            x: [batch_size, seq_len, hidden_size], MLP层的正常输入
+            t: [batch_size, seq_len, hidden_size], TTT层快权重更新目标, 仅对TTT层有效, 其他层为None
+        Tips: t的处理逻辑在decoder layer中
+        """
+        h = self.act_fn(self.gate_proj(x)) * self.up_proj(x) # [batch_size, seq_len, intermediate_size]
         # TTT: branch on whether this is a TTT layer with target states
         if t is None or not hasattr(self, "ttt_conv"):
             return self.down_proj(h)
         # TTT path
-        t = self.padding(t)
-        h_padded = self.padding(h)
+        t = self.padding(t) # [batch_size, chunk_num, chunk_size, hidden_size]
+        h_padded = self.padding(h) # [batch_size, chunk_num, chunk_size, intermediate_size]
         bs, chunk_num, chunk_size, _ = t.shape
+        # 公式: V[i]=Conv1D(X0)W_target
+        # 先算Conv1D(X0)
         t = (
-            self.ttt_conv(t.transpose(-1, -2).reshape(bs * chunk_num, -1, chunk_size))
+            self.ttt_conv(t.transpose(-1, -2) # [bs, chunk_num, hidden_size, chunk_size]
+                           .reshape(bs * chunk_num, -1, chunk_size) # [bs * chunk_num, hidden_size, chunk_size]
+            ) # [bs * chunk_num, hidden_size, chunk_size]
             .transpose(-1, -2)
             .reshape(bs, chunk_num, chunk_size, -1)
-        )
+        ) # [batch_size, chunk_num, chunk_size, hidden_size]
+
+        # 计算每chunk的ΔW_down
         if self.ttt_proj is not None:
             d_down_proj = contract(
                 "b t c h, b t c d, d e -> b t e h",
-                h_padded[:, :-1], t[:, :-1], self.ttt_proj.weight,
-            )
+                h_padded[:, :-1], # [b, chunk_num - 1, chunk_size, intermediate_size]
+                t[:, :-1], # [b, chunk_num - 1, chunk_size, hidden_size]
+                self.ttt_proj.weight, # [hidden_size, hidden_size]
+            ) # [batch_size, chunk_num - 1, hidden_size, intermediate_size]
         else:
             d_down_proj = contract(
                 "b t c h, b t c d -> b t d h",
                 h_padded[:, :-1], t[:, :-1],
             )
+        # 累加到原始W_down
         d_down_proj = torch.cat(
             [repeat(self.down_proj.weight, "d h -> b 1 d h", b=bs), d_down_proj * self.ttt_lr],
             dim=1,
-        )
+        )# [batch_size, chunk_num, hidden_size, intermediate_size]
         d_down_proj_sum = d_down_proj.cumsum(dim=1)
-        down_proj = contract("b t d h, b t c h -> b t c d", d_down_proj_sum, h_padded)
+        down_proj = contract("b t d h, b t c h -> b t c d", d_down_proj_sum, h_padded) # [batch_size, chunk_num, chunk_size, hidden_size]
         return rearrange(down_proj, "b t c d -> b (t c) d")[:, : x.shape[1], :]
 
 
@@ -330,6 +350,8 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+        # 配合_resolve_ttt_target_states方法，默认使用hidden_states作为TTT目标
+        # 预训练使用input_embeds, 继续训练使用hidden_states
         if target_states is None and self.is_ttt_layer:
             target_states = hidden_states
         hidden_states = self.mlp(hidden_states, t=target_states)
