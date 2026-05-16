@@ -170,3 +170,5 @@ models
 gpu.py
 vscode.sh
 qwen3/
+CLAUDE.md
+AGENTS.md

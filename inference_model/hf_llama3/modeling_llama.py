@@ -182,6 +182,10 @@ class LlamaMLP(nn.Module):
             else:
                 self.ttt_proj = None
             self.ttt_lr = config.ttt_lr
+            # TTT: paper Appendix C.2 inference fast-weight update clipping; default tau=1e-5.
+            # Set tau <= 0 to disable.
+            self.ttt_clip_tau = float(getattr(config, "ttt_clip_tau", 1.0e-5))
+            self.ttt_clip_hook = None
             self.ttt_conv = nn.Conv1d(
                 self.hidden_size,
                 self.hidden_size,
@@ -234,6 +238,29 @@ class LlamaMLP(nn.Module):
                     )
                 else:
                     dw = contract("c h, c d -> d h", current_h, current_t) * self.ttt_lr
+                # TTT: paper Appendix C.2 clipping ||dw||_F <= tau
+                if self.ttt_clip_tau > 0:
+                    dw_fp32 = dw.to(torch.float32)
+                    dw_norm = torch.linalg.norm(dw_fp32)
+                    if dw_norm > self.ttt_clip_tau:
+                        clip_scale = self.ttt_clip_tau / dw_norm
+                        if self.ttt_clip_hook is not None:
+                            self.ttt_clip_hook(
+                                {
+                                    "layer_idx": self.layer_idx,
+                                    "chunk_idx": i,
+                                    "chunk_start": i * self.ttt_chunk,
+                                    "chunk_end": min((i + 1) * self.ttt_chunk, seq_len),
+                                    "chunk_num": chunk_num,
+                                    "seq_len": seq_len,
+                                    "pre_clip_norm": float(dw_norm.detach().cpu()),
+                                    "clip_tau": self.ttt_clip_tau,
+                                    "clip_scale": float(clip_scale.detach().cpu()),
+                                    "dtype": str(dw.dtype),
+                                    "device": str(dw.device),
+                                }
+                            )
+                        dw = (dw_fp32 * clip_scale).to(dtype=dw.dtype)
                 current_w = current_w + dw
         out = rearrange(y, "b t c d -> b (t c) d")[:, :seq_len, :]
         return out, current_w
@@ -486,6 +513,11 @@ class LlamaModel(LlamaPreTrainedModel):
             return inputs_embeds
         return None
 
+    def set_ttt_clip_hook(self, hook: Optional[Callable[[dict], None]]):
+        for decoder_layer in self.layers:
+            if hasattr(decoder_layer.mlp, "ttt_clip_hook"):
+                decoder_layer.mlp.ttt_clip_hook = hook
+
     @check_model_inputs()
     @auto_docstring
     def forward(
@@ -576,6 +608,9 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             if input_ids is not None:
                 assert len(input_ids) == 1, "only support bs=1 for TTT inference"
         return super().generate(**kwargs)
+
+    def set_ttt_clip_hook(self, hook: Optional[Callable[[dict], None]]):
+        self.model.set_ttt_clip_hook(hook)
 
     @can_return_tuple
     @auto_docstring

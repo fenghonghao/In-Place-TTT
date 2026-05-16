@@ -193,6 +193,7 @@ class LlamaConfig(PretrainedConfig):
         ttt_lr=0.3,
         ttt_chunk=8192,
         ttt_target="hidden_states",
+        ttt_clip_tau=1.0e-5,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -227,6 +228,9 @@ class LlamaConfig(PretrainedConfig):
         self.ttt_target = ttt_target
         if self.ttt_target not in {"hidden_states", "input_embed"}:
             raise ValueError("ttt_target must be one of {'hidden_states', 'input_embed'}")
+        # TTT: paper Appendix C.2 inference fast-weight update clipping; default tau=1e-5.
+        # Set tau <= 0 to disable.
+        self.ttt_clip_tau = float(ttt_clip_tau)
         # Validate the correctness of rotary position embeddings parameters
         # BC: if there is a 'type' field, copy it it to 'rope_type'.
         if self.rope_scaling is not None and "type" in self.rope_scaling:

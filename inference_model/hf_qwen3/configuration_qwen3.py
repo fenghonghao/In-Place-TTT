@@ -187,6 +187,7 @@ class Qwen3Config(PretrainedConfig):
         ttt_lr=0.3,
         ttt_chunk=8192,
         ttt_target="hidden_states",
+        ttt_clip_tau=1.0e-5,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -238,6 +239,9 @@ class Qwen3Config(PretrainedConfig):
         self.ttt_target = ttt_target
         if self.ttt_target not in {"hidden_states", "input_embed"}:
             raise ValueError("ttt_target must be one of {'hidden_states', 'input_embed'}")
+        # TTT: paper Appendix C.2 inference fast-weight update clipping; default tau=1e-5.
+        # Set tau <= 0 to disable.
+        self.ttt_clip_tau = float(ttt_clip_tau)
 
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,
