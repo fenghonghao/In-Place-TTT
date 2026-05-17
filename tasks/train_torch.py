@@ -80,10 +80,32 @@ logger = helper.create_logger(__name__)
 
 
 @dataclass
+class FreezeArguments:
+    """
+    支持在微调指令模型时进行选择性参数冻结（适用于仅微调 TTT 或 TTT+down_proj 的场景）。
+
+    可通过 YAML 配置文件（顶层的 `freeze:` 字段）或命令行参数（`--freeze.enable true`）来启用。
+    当 `enable=False` 时，不执行任何参数冻结操作（no-op），此时的训练行为与标准的全参数微调流程完全一致。
+    """
+
+    enable: bool = False
+    # 对 `named_parameters()` 返回的参数名进行子串匹配。
+    # 如果参数名中包含这里的任意一个模式（pattern），该参数将保持可训练。
+    # 如果列表为空且 enable=True，则会冻结所有参数，并抛出异常（见 `_apply_freeze`）。
+    trainable_patterns: List[str] = field(default_factory=list)
+    # 仅当参数的完整名称中包含 `.layers.<i>.`（其中 `i` 属于 `config.ttt_layers`）时，才会匹配此处的模式。
+    # 适用于那些每一层都存在、但只应在启用了 TTT 的层上进行训练的逐层模块（例如 `down_proj`）。
+    trainable_on_ttt_layers: List[str] = field(default_factory=list)
+    # 在 rank-0 上打印统计信息，并抽样展示部分可训练/已冻结的参数名称，以便进行正确性检查（sanity check）。
+    verbose: bool = True
+
+
+@dataclass
 class Arguments:
     model: "ModelArguments" = field(default_factory=ModelArguments)
     data: "DataArguments" = field(default_factory=DataArguments)
     train: "TrainingArguments" = field(default_factory=TrainingArguments)
+    freeze: FreezeArguments = field(default_factory=FreezeArguments)
 
 
 def _filter_kwargs_for_callable(fn, kwargs: Dict[str, Any]) -> Dict[str, Any]:
@@ -113,6 +135,97 @@ def _pop_dict_cli_arg(arg_name: str) -> Dict[str, Any] | None:
     if parsed is None:
         raise ValueError(f"{arg_name} expects a dict-like string, got: {raw}")
     return parsed
+
+
+def _apply_freeze(model, freeze_cfg: "FreezeArguments", model_config) -> Dict[str, Any]:
+    """
+    根据冻结配置设置参数的 requires_grad 属性。
+
+    必须在 `build_parallelize_model`（FSDP2 封装）之前和 `build_optimizer` 之前调用。
+    对于 meta tensor 也是安全的，因为 requires_grad 只是一个标记，不依赖于具体数据；
+    该标记可以在 PyTorch 的 `_apply` 路径（`model.float()` 和 `model.to_empty(...)` 都会用到）中保留，
+    因为 `nn.Module._apply` 会通过 `nn.Parameter(t, requires_grad=orig.requires_grad)` 重新构建 Parameter 对象。
+
+    返回一个可以直接合并到 wandb config 中的统计信息字典。
+    无论如何都会返回（即使 enable=False 也会返回默认统计），因此调用层不需要写条件分支。
+
+    No-op 路径（返回的 stats 中 `freeze.applied=False`）有两条：
+      1. `enable=False` —— 静默 no-op。
+      2. `enable=True` 但 `model_config.ttt_mode=False` —— rank-0 打 warning 后 fallback
+         到全参微调，避免在没有 TTT 模块的模型上误把 down_proj 当成 TTT 目标训练。
+    """
+    n_total_elems_all = sum(p.numel() for p in model.parameters())
+    n_param_tensors_all = sum(1 for _ in model.parameters())
+    no_op_stats = {
+        "freeze.applied": False,
+        "freeze.trainable_param_tensors": n_param_tensors_all,
+        "freeze.total_param_tensors": n_param_tensors_all,
+        "freeze.trainable_elems": n_total_elems_all,
+        "freeze.total_elems": n_total_elems_all,
+        "freeze.trainable_ratio": 1.0,
+    }
+    if not freeze_cfg.enable:
+        return no_op_stats
+
+    if not bool(getattr(model_config, "ttt_mode", False)):
+        logger.info_rank0(
+            "[freeze][WARN] freeze.enable=True but model_config.ttt_mode=False. "
+            "Selective freeze targets TTT modules (ttt_proj/ttt_conv) which do not "
+            "exist when ttt_mode is off; trainable_on_ttt_layers would also match "
+            "non-TTT down_proj layers. Skipping _apply_freeze and falling back to "
+            "full fine-tuning. Set freeze.enable=false in your YAML to suppress."
+        )
+        return no_op_stats
+
+    ttt_layer_ids = set(getattr(model_config, "ttt_layers", []) or [])
+    ttt_layer_tokens = tuple(f".layers.{i}." for i in ttt_layer_ids)
+
+    n_total, n_trainable = 0, 0
+    trainable_names: List[str] = []
+    frozen_names: List[str] = []
+    for name, param in model.named_parameters():
+        n_total += 1
+        hit_global = any(pat in name for pat in freeze_cfg.trainable_patterns)
+        hit_layer = bool(ttt_layer_tokens) and (
+            any(pat in name for pat in freeze_cfg.trainable_on_ttt_layers)
+            and any(tok in name for tok in ttt_layer_tokens)
+        )
+        if hit_global or hit_layer:
+            param.requires_grad = True
+            n_trainable += 1
+            trainable_names.append(name)
+        else:
+            param.requires_grad = False
+            frozen_names.append(name)
+
+    n_trainable_elems = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_total_elems = sum(p.numel() for p in model.parameters())
+    ratio = n_trainable_elems / max(1, n_total_elems)
+
+    if freeze_cfg.verbose:
+        logger.info_rank0(
+            f"[freeze] trainable param tensors: {n_trainable}/{n_total} "
+            f"({n_trainable_elems / 1e6:.2f}M / {n_total_elems / 1e6:.2f}M = {100 * ratio:.3f}%)"
+        )
+        logger.info_rank0(f"[freeze] first 8 trainable: {trainable_names[:8]}")
+        logger.info_rank0(f"[freeze] first 4 frozen:    {frozen_names[:4]}")
+
+    if n_trainable == 0:
+        raise RuntimeError(
+            "[freeze] No trainable params after applying freeze rules. Check "
+            f"trainable_patterns={freeze_cfg.trainable_patterns} and "
+            f"trainable_on_ttt_layers={freeze_cfg.trainable_on_ttt_layers} "
+            f"vs ttt_layers={sorted(ttt_layer_ids)}."
+        )
+
+    return {
+        "freeze.applied": True,
+        "freeze.trainable_param_tensors": n_trainable,
+        "freeze.total_param_tensors": n_total,
+        "freeze.trainable_elems": n_trainable_elems,
+        "freeze.total_elems": n_total_elems,
+        "freeze.trainable_ratio": ratio,
+    }
 
 
 def _compute_train_steps_compat(args, dataset_length):
@@ -260,6 +373,10 @@ def main():
     model_config = model.config
     helper.print_device_mem_info("VRAM usage after building model")
 
+    # 针对指令模型的仅 TTT 或 TTT+down_proj 微调，执行选择性参数冻结。
+    # 该操作在 FSDP2 封装前的 meta tensor 上运行；build_optimizer 会自动跳过已冻结的参数。
+    freeze_stats = _apply_freeze(model, args.freeze, model_config)
+
     get_optimizer_pre_hook = getattr(model, "get_optimizer_pre_hook", None)
     model = build_parallelize_model(
         model,
@@ -302,7 +419,15 @@ def main():
                 project=args.train.wandb_project,
                 name=args.train.wandb_name,
                 settings=wandb.Settings(console="off"),
-                config={**vars(args.model), **vars(args.data), **vars(args.train)},  # flatten dict
+                config={
+                    **vars(args.model),
+                    **vars(args.data),
+                    **vars(args.train),
+                    # 使用 freeze.* 前缀，避免与 TrainingArguments 中的键发生冲突（例如 `enable` 字段）。
+                    **{f"freeze.{k}": v for k, v in vars(args.freeze).items()},
+                    # 包含从 _apply_freeze 函数获取的推导统计信息（如 freeze.applied、freeze.trainable_ratio 等）。
+                    **freeze_stats,
+                },
             )
 
         # save model_assets before training

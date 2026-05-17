@@ -3,50 +3,30 @@
 ## 1. 推理时 fast-weight 更新 clipping(论文附录 C.2)
 
 为推理路径(`inference_model/hf_qwen3/`、`inference_model/hf_llama3/`)添加 per-chunk
-快速权重增量的 Frobenius 范数裁剪,与论文附录 C.2 中用于 Qwen3-4B 评测的稳定化机制对齐。
+fast-weight 增量的 Frobenius 范数裁剪,与论文附录 C.2 在 Qwen3-4B 评测中使用的
+稳定化机制对齐。
 
-### 改动要点
-
-- **新增 config 字段** `ttt_clip_tau`,默认 `1e-5`(论文报告值)。设为 `<= 0` 可关闭裁剪。
+- 新增 config 字段 `ttt_clip_tau`,默认 `1e-5`(论文报告值),设为 `<= 0` 可关闭。
   影响 `Qwen3Config` 与 `LlamaConfig`。
-- **裁剪规则**:每个 chunk 计算 `dw = η · contract(h, t, ttt_proj)` 后,若
-  `‖dw‖_F > τ`,则 `dw ← τ · dw / ‖dw‖_F`,再累加到 `current_w`。
-  范数计算在 fp32 下完成以避免 bf16 精度问题。
-- **作用域**:仅推理。训练侧(`hf_models/`)不变,以免破坏 autograd 与 prefix-sum。
-- **向后兼容**:`getattr(config, "ttt_clip_tau", 1e-5)` 兜底,旧 checkpoint 无需重训。
+- 仅推理生效;训练侧 `hf_models/` 不变(保留论文 §3.4 的并行 prefix-sum 实现)。
+- 暴露 `set_ttt_clip_hook(hook)`,便于观测裁剪频率与幅度。
+- 旧 HF checkpoint 无需重训,modeling 侧 `getattr` 兜底向后兼容。
 
-### Hook 用法(可选,用于观测裁剪频率/幅度)
+> 完整说明、使用方法、注意事项、实现要点见
+> [docs/inference_fast_weight_clipping.md](docs/inference_fast_weight_clipping.md)。
 
-`Qwen3ForCausalLM` 与 `LlamaForCausalLM` 暴露 `set_ttt_clip_hook(hook)`。每次发生
-裁剪时,hook 会被以一个 dict 回调,字段如下:
+## 2. 训练时选择性参数冻结(instruct 模型微调)
 
-| key | 含义 |
-|---|---|
-| `layer_idx` | 触发裁剪的 decoder 层索引 |
-| `chunk_idx` | 当前 chunk 在序列中的序号 |
-| `chunk_start` / `chunk_end` | 该 chunk 覆盖的 token 区间 |
-| `chunk_num` / `seq_len` | 当前 forward 的总 chunk 数与序列长度 |
-| `pre_clip_norm` | 裁剪前的 `‖dw‖_F`(Python float) |
-| `clip_tau` | 当前阈值 τ |
-| `clip_scale` | 实际施加的缩放系数 `τ / ‖dw‖_F` |
-| `dtype` / `device` | `dw` 的 dtype 与 device |
+为训练侧(`tasks/train_torch.py`)新增基于参数名模式匹配的选择性冻结机制,
+配合论文 §C.3 的近零初始化,用于在不破坏 instruct 模型对齐能力的前提下,
+仅训练 TTT 模块(或 TTT + 同层 `down_proj`)。
 
-示例:
+- 新增顶层 YAML 段 `freeze`(`FreezeArguments`);`enable` 默认 `false`,
+  未启用时训练行为与改动前一致。
+- 新增示例配置 `configs/pretrain/qwen3_instruct_ttt.yaml`、
+  `configs/pretrain/llama3_instruct_ttt.yaml`。
+- 推理侧 `inference_model/` 不受影响;DCP / HF checkpoint 产物仍为完整模型。
 
-```python
-import inference_model  # 触发 AutoModel 注册
-from transformers import AutoModelForCausalLM
+> 完整说明、使用方法、注意事项、实现要点、验证与排错见
+> [docs/training_selective_freeze.md](docs/training_selective_freeze.md)。
 
-model = AutoModelForCausalLM.from_pretrained("/path/to/hf_ckpt")
-
-events = []
-model.set_ttt_clip_hook(lambda ev: events.append(ev))
-
-# ... 跑一次 generate / forward ...
-
-model.set_ttt_clip_hook(None)        # 关闭 hook
-print(f"clip triggered {len(events)} times")
-```
-
-> 注意:hook 内的 `pre_clip_norm` / `clip_scale` 会触发 CUDA→host 同步,启用后
-> 推理吞吐会下降。仅建议在调试或采样统计时打开,生产推理保持 `None`。
